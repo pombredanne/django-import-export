@@ -1,12 +1,22 @@
-===========
+==========
 Change Log
-===========
+==========
 
-0.1.4 (non released)
-====================
+0.1.5 (unreleased)
+==================
+
+* Prevent queryset caching when exporting (#44)
+* Allow unchanged rows to be skipped when importing (#30)
+
+0.1.4
+=====
+
+* Use `field_name` instead of `column_name` for field dehydration, FIX #36
 
 * Handle OneToOneField,  FIX #17 - Exception when attempting access something
   on the related_name.
+
+* FIX #23 - export filter not working
 
 0.1.3
 =====

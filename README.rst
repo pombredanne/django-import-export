@@ -4,6 +4,10 @@ django-import-export
 
 .. image:: https://travis-ci.org/bmihelac/django-import-export.png?branch=master
         :target: https://travis-ci.org/bmihelac/django-import-export
+.. image:: https://pypip.in/d/django-import-export/badge.png
+    :target: https://crate.io/packages/django-import-export
+.. image:: https://pypip.in/v/django-import-export/badge.png   
+    :target: https://crate.io/packages/django-import-export
 
 django-import-export is a Django application and library for importing
 and exporting data with included admin integration.
@@ -20,6 +24,8 @@ Features:
 * admin integration for exporting
 
 * export data respecting admin filters
+
+.. image:: https://raw.github.com/bmihelac/django-import-export/master/docs/_static/images/django-import-export-change.png
 
 Documentation
 -------------

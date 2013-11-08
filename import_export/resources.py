@@ -50,6 +50,12 @@ class ResourceOptions(object):
     * ``use_transactions`` - Controls if import should use database
       transactions. Default value is ``None`` meaning
       ``settings.IMPORT_EXPORT_USE_TRANSACTIONS`` will be evaluated.
+      
+    * ``skip_unchanged`` - Controls if the import should skip unchanged records.
+      Default value is False
+
+    * ``report_skipped`` - Controls if the result reports skipped rows
+      Default value is True
 
     """
     fields = None
@@ -60,6 +66,8 @@ class ResourceOptions(object):
     export_order = None
     widgets = None
     use_transactions = None
+    skip_unchanged = False
+    report_skipped = True
 
     def __new__(cls, meta=None):
         overrides = {}
@@ -112,6 +120,17 @@ class Resource(object):
         """
         return [self.fields[f] for f in self.get_export_order()]
 
+    @classmethod
+    def get_field_name(cls, field):
+        """
+        Returns field name for given field.
+        """
+        for field_name, f in cls.fields.items():
+            if f == field:
+                return field_name
+        raise AttributeError("Field %s does not exists in %s resource" % (
+            field, cls))
+
     def init_instance(self, row=None):
         raise NotImplementedError()
 
@@ -124,9 +143,6 @@ class Resource(object):
             return (instance, False)
         else:
             return (self.init_instance(row), True)
-
-    def set_instance_attr(self, instance, row, field):
-        setattr(instance, self.get_mapping()[field], row[field])
 
     def save_instance(self, instance, dry_run=False):
         self.before_save_instance(instance, dry_run)
@@ -197,6 +213,26 @@ class Resource(object):
         Override this method to handle deletion.
         """
         return False
+
+    def skip_row(self, instance, original):
+        """
+        Returns ``True`` if ``row`` importing should be skipped.
+
+        Default implementation returns ``False`` unless skip_unchanged == True.
+        Override this method to handle skipping rows meeting certain conditions.
+        """
+        if not self._meta.skip_unchanged:
+            return False
+        for field in self.get_fields():
+            try:
+                # For fields that are models.fields.related.ManyRelatedManager
+                # we need to compare the results
+                if list(field.get_value(instance).all()) != list(field.get_value(original).all()):
+                    return False
+            except AttributeError:
+                if field.get_value(instance) != field.get_value(original):
+                    return False
+        return True
 
     def get_diff(self, original, current, dry_run=False):
         """
@@ -272,8 +308,11 @@ class Resource(object):
                                 real_dry_run)
                 else:
                     self.import_obj(instance, row)
-                    self.save_instance(instance, real_dry_run)
-                    self.save_m2m(instance, row, real_dry_run)
+                    if self.skip_row(instance, original):
+                        row_result.import_type = RowResult.IMPORT_TYPE_SKIP
+                    else:
+                        self.save_instance(instance, real_dry_run)
+                        self.save_m2m(instance, row, real_dry_run)
                     row_result.diff = self.get_diff(original, instance,
                             real_dry_run)
             except Exception, e:
@@ -284,7 +323,9 @@ class Resource(object):
                         transaction.rollback()
                         transaction.leave_transaction_management()
                     raise
-            result.rows.append(row_result)
+            if (row_result.import_type != RowResult.IMPORT_TYPE_SKIP or 
+                        self._meta.report_skipped): 
+                result.rows.append(row_result)
 
         if use_transactions:
             if dry_run or result.has_errors():
@@ -299,7 +340,8 @@ class Resource(object):
         return self._meta.export_order or self.fields.keys()
 
     def export_field(self, field, obj):
-        method = getattr(self, 'dehydrate_%s' % field.column_name, None)
+        field_name = self.get_field_name(field)
+        method = getattr(self, 'dehydrate_%s' % field_name, None)
         if method is not None:
             return method(obj)
         return field.export(obj)
@@ -312,11 +354,16 @@ class Resource(object):
         return headers
 
     def export(self, queryset=None):
-        if not queryset:
+        """
+        Exports a resource.
+        """
+        if queryset is None:
             queryset = self.get_queryset()
         headers = self.get_export_headers()
         data = tablib.Dataset(headers=headers)
-        for obj in queryset:
+        # Iterate without the queryset cache, to avoid wasting memory when
+        # exporting large datasets.
+        for obj in queryset.iterator():
             data.append(self.export_resource(obj))
         return data
 

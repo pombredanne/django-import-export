@@ -1,3 +1,5 @@
+from __future__ import unicode_literals
+
 import functools
 from copy import deepcopy
 import sys
@@ -8,6 +10,7 @@ from diff_match_patch import diff_match_patch
 
 from django.utils.safestring import mark_safe
 from django.utils.datastructures import SortedDict
+from django.utils import six
 from django.db import transaction
 from django.db.models.related import RelatedObject
 from django.conf import settings
@@ -16,8 +19,14 @@ from .results import Error, Result, RowResult
 from .fields import Field
 from import_export import widgets
 from .instance_loaders import (
-        ModelInstanceLoader,
-        )
+    ModelInstanceLoader,
+)
+
+
+try:
+    from django.utils.encoding import force_text
+except ImportError:
+    from django.utils.encoding import force_unicode as force_text
 
 
 USE_TRANSACTIONS = getattr(settings, 'IMPORT_EXPORT_USE_TRANSACTIONS', False)
@@ -50,7 +59,7 @@ class ResourceOptions(object):
     * ``use_transactions`` - Controls if import should use database
       transactions. Default value is ``None`` meaning
       ``settings.IMPORT_EXPORT_USE_TRANSACTIONS`` will be evaluated.
-      
+
     * ``skip_unchanged`` - Controls if the import should skip unchanged records.
       Default value is False
 
@@ -77,7 +86,7 @@ class ResourceOptions(object):
                 if not override_name.startswith('_'):
                     overrides[override_name] = getattr(meta, override_name)
 
-        return object.__new__(type('ResourceOptions', (cls,), overrides))
+        return object.__new__(type(str('ResourceOptions'), (cls,), overrides))
 
 
 class DeclarativeMetaclass(type):
@@ -85,7 +94,7 @@ class DeclarativeMetaclass(type):
     def __new__(cls, name, bases, attrs):
         declared_fields = []
 
-        for field_name, obj in attrs.items():
+        for field_name, obj in attrs.copy().items():
             if isinstance(obj, Field):
                 field = attrs.pop(field_name)
                 if not field.column_name:
@@ -101,12 +110,11 @@ class DeclarativeMetaclass(type):
         return new_class
 
 
-class Resource(object):
+class Resource(six.with_metaclass(DeclarativeMetaclass)):
     """
     Resource defines how objects are mapped to their import and export
     representations and handle importing and exporting data.
     """
-    __metaclass__ = DeclarativeMetaclass
 
     def get_use_transactions(self):
         if self._meta.use_transactions is None:
@@ -184,7 +192,7 @@ class Resource(object):
         if field.attribute and field.column_name in data:
             field.save(obj, data)
 
-    def import_obj(self, obj, data):
+    def import_obj(self, obj, data, dry_run):
         """
         """
         for field in self.get_fields():
@@ -247,7 +255,7 @@ class Resource(object):
         for field in self.get_fields():
             v1 = self.export_field(field, original) if original else ""
             v2 = self.export_field(field, current) if current else ""
-            diff = dmp.diff_main(unicode(v1), unicode(v2))
+            diff = dmp.diff_main(force_text(v1), force_text(v2))
             dmp.diff_cleanupSemantic(diff)
             html = dmp.diff_prettyHtml(diff)
             html = mark_safe(html)
@@ -259,6 +267,12 @@ class Resource(object):
         Diff representation headers.
         """
         return self.get_export_headers()
+
+    def before_import(self, dataset, dry_run):
+        """
+        Override to add additional logic.
+        """
+        pass
 
     def import_data(self, dataset, dry_run=False, raise_errors=False,
             use_transactions=None):
@@ -286,6 +300,17 @@ class Resource(object):
 
         instance_loader = self._meta.instance_loader_class(self, dataset)
 
+        try:
+            self.before_import(dataset, real_dry_run)
+        except Exception as e:
+            tb_info = traceback.format_exc(sys.exc_info()[2])
+            result.base_errors.append(Error(repr(e), tb_info))
+            if raise_errors:
+                if use_transactions:
+                    transaction.rollback()
+                    transaction.leave_transaction_management()
+                raise
+
         for row in dataset.dict:
             try:
                 row_result = RowResult()
@@ -307,24 +332,27 @@ class Resource(object):
                         row_result.diff = self.get_diff(original, None,
                                 real_dry_run)
                 else:
-                    self.import_obj(instance, row)
+                    self.import_obj(instance, row, real_dry_run)
                     if self.skip_row(instance, original):
                         row_result.import_type = RowResult.IMPORT_TYPE_SKIP
                     else:
                         self.save_instance(instance, real_dry_run)
                         self.save_m2m(instance, row, real_dry_run)
+                        # Add object info to RowResult for LogEntry
+                        row_result.object_repr = str(instance)
+                        row_result.object_id = instance.pk
                     row_result.diff = self.get_diff(original, instance,
                             real_dry_run)
-            except Exception, e:
-                tb_info = traceback.format_exc(sys.exc_info()[2])
+            except Exception as e:
+                tb_info = traceback.format_exc(2)
                 row_result.errors.append(Error(repr(e), tb_info))
                 if raise_errors:
                     if use_transactions:
                         transaction.rollback()
                         transaction.leave_transaction_management()
-                    raise
-            if (row_result.import_type != RowResult.IMPORT_TYPE_SKIP or 
-                        self._meta.report_skipped): 
+                    six.reraise(*sys.exc_info())
+            if (row_result.import_type != RowResult.IMPORT_TYPE_SKIP or
+                        self._meta.report_skipped):
                 result.rows.append(row_result)
 
         if use_transactions:
@@ -429,11 +457,10 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
         return new_class
 
 
-class ModelResource(Resource):
+class ModelResource(six.with_metaclass(ModelDeclarativeMetaclass, Resource)):
     """
     ModelResource is Resource subclass for handling Django models.
     """
-    __metaclass__ = ModelDeclarativeMetaclass
 
     @classmethod
     def widget_from_django_field(cls, f, default=widgets.Widget):
@@ -486,9 +513,9 @@ def modelresource_factory(model, resource_class=ModelResource):
     Factory for creating ``ModelResource`` class for given Django model.
     """
     attrs = {'model': model}
-    Meta = type('Meta', (object,), attrs)
+    Meta = type(str('Meta'), (object,), attrs)
 
-    class_name = model.__name__ + 'Resource'
+    class_name = model.__name__ + str('Resource')
 
     class_attrs = {
         'Meta': Meta,

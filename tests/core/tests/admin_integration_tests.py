@@ -1,8 +1,11 @@
+from __future__ import unicode_literals
+
 import os.path
 
 from django.test.testcases import TestCase
 from django.contrib.auth.models import User
 from django.utils.translation import ugettext_lazy as _
+from django.contrib.admin.models import LogEntry
 
 from core.admin import BookAdmin
 
@@ -28,15 +31,16 @@ class ImportExportAdminIntegrationTest(TestCase):
     def test_import(self):
         input_format = '0'
         filename = os.path.join(
-                os.path.dirname(__file__),
-                os.path.pardir,
-                'exports',
-                'books.csv')
-        data = {
+            os.path.dirname(__file__),
+            os.path.pardir,
+            'exports',
+            'books.csv')
+        with open(filename, "rb") as f:
+            data = {
                 'input_format': input_format,
-                'import_file': open(filename),
-                }
-        response = self.client.post('/admin/core/book/import/', data)
+                'import_file': f,
+            }
+            response = self.client.post('/admin/core/book/import/', data)
         self.assertEqual(response.status_code, 200)
         self.assertIn('result', response.context)
         self.assertFalse(response.context['result'].has_errors())
@@ -69,3 +73,40 @@ class ImportExportAdminIntegrationTest(TestCase):
 
         self.assertContains(response, _('Export'))
         self.assertContains(response, _('Import'))
+
+    def test_import_file_name_in_tempdir(self):
+        # 65 - import_file_name form field can be use to access the filesystem
+        import_file_name = os.path.join(
+            os.path.dirname(__file__),
+            os.path.pardir,
+            'exports',
+            'books.csv')
+        data = {
+            'input_format': "0",
+            'import_file_name': import_file_name,
+        }
+        with self.assertRaises(IOError):
+            self.client.post('/admin/core/book/process_import/', data)
+
+    def test_import_log_entry(self):
+        input_format = '0'
+        filename = os.path.join(
+            os.path.dirname(__file__),
+            os.path.pardir,
+            'exports',
+            'books.csv')
+        with open(filename, "rb") as f:
+            data = {
+                'input_format': input_format,
+                'import_file': f,
+            }
+            response = self.client.post('/admin/core/book/import/', data)
+        self.assertEqual(response.status_code, 200)
+        confirm_form = response.context['confirm_form']
+        data = confirm_form.initial
+        response = self.client.post('/admin/core/book/process_import/', data,
+                follow=True)
+        self.assertEqual(response.status_code, 200)
+        book = LogEntry.objects.latest('id')
+        self.assertEqual(book.object_repr, "Some book")
+        self.assertEqual(book.object_id, str(1))

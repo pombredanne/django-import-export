@@ -2,12 +2,14 @@ from __future__ import unicode_literals
 
 import os.path
 
+from django.test.utils import override_settings
 from django.test.testcases import TestCase
 from django.contrib.auth.models import User
 from django.utils.translation import ugettext_lazy as _
 from django.contrib.admin.models import LogEntry
 
 from core.admin import BookAdmin
+from core.models import Category
 
 
 class ImportExportAdminIntegrationTest(TestCase):
@@ -28,7 +30,15 @@ class ImportExportAdminIntegrationTest(TestCase):
         self.assertContains(response, _('Import'))
         self.assertContains(response, _('Export'))
 
+    @override_settings(TEMPLATE_STRING_IF_INVALID='INVALID_VARIABLE')
     def test_import(self):
+        # GET the import form
+        response = self.client.get('/admin/core/book/import/')
+        self.assertEqual(response.status_code, 200)
+        self.assertTemplateUsed(response, 'admin/import_export/import.html')
+        self.assertContains(response, 'form action=""')
+
+        # POST the import form
         input_format = '0'
         filename = os.path.join(
             os.path.dirname(__file__),
@@ -110,3 +120,37 @@ class ImportExportAdminIntegrationTest(TestCase):
         book = LogEntry.objects.latest('id')
         self.assertEqual(book.object_repr, "Some book")
         self.assertEqual(book.object_id, str(1))
+
+
+class ExportActionAdminIntegrationTest(TestCase):
+
+    def setUp(self):
+        user = User.objects.create_user('admin', 'admin@example.com',
+                                        'password')
+        user.is_staff = True
+        user.is_superuser = True
+        user.save()
+
+        self.cat1 = Category.objects.create(name='Cat 1')
+        self.cat2 = Category.objects.create(name='Cat 2')
+
+        self.client.login(username='admin', password='password')
+
+    def test_export(self):
+        data = {
+            'action': ['export_admin_action'],
+            'file_format': '0',
+            '_selected_action': [str(self.cat1.id)],
+        }
+        response = self.client.post('/admin/core/category/', data)
+        self.assertContains(response, self.cat1.name, status_code=200)
+        self.assertNotContains(response, self.cat2.name, status_code=200)
+        self.assertTrue(response.has_header("Content-Disposition"))
+
+    def test_export_no_format_selected(self):
+        data = {
+            'action': ['export_admin_action'],
+            '_selected_action': [str(self.cat1.id)],
+        }
+        response = self.client.post('/admin/core/category/', data)
+        self.assertEqual(response.status_code, 302)

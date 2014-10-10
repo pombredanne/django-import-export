@@ -4,6 +4,8 @@ from decimal import Decimal
 from datetime import date
 from copy import deepcopy
 
+from django.db import models
+from django.db.models.fields import FieldDoesNotExist
 from django.test import (
         TestCase,
         TransactionTestCase,
@@ -67,7 +69,6 @@ class BookResource(resources.ModelResource):
 
 
 class ModelResourceTest(TestCase):
-
     def setUp(self):
         self.resource = BookResource()
 
@@ -113,6 +114,18 @@ class ModelResourceTest(TestCase):
                 self.dataset.dict[0])
         self.assertEqual(instance, self.book)
 
+    def test_get_instance_with_missing_field_data(self):
+        instance_loader = self.resource._meta.instance_loader_class(
+                self.resource)
+        # construct a dataset with a missing "id" column
+        dataset = tablib.Dataset(headers=['name', 'author_email', 'price'])
+        dataset.append(['Some book', 'test@example.com', "10.25"])
+        with self.assertRaises(KeyError) as cm:
+            instance = self.resource.get_instance(instance_loader,
+                dataset.dict[0])
+        self.assertEqual(u"Column 'id' not found in dataset. Available columns "
+            "are: %s" % [u'name', u'author_email', u'price'], cm.exception.args[0])
+
     def test_get_export_headers(self):
         headers = self.resource.get_export_headers()
         self.assertEqual(headers, ['published_date',
@@ -121,6 +134,10 @@ class ModelResourceTest(TestCase):
 
     def test_export(self):
         dataset = self.resource.export(Book.objects.all())
+        self.assertEqual(len(dataset), 1)
+
+    def test_export_iterable(self):
+        dataset = self.resource.export(list(Book.objects.all()))
         self.assertEqual(len(dataset), 1)
 
     def test_get_diff(self):
@@ -145,6 +162,24 @@ class ModelResourceTest(TestCase):
         self.assertEqual(instance.author_email, 'test@example.com')
         self.assertEqual(instance.price, Decimal("10.25"))
 
+    def test_import_data_value_error_includes_field_name(self):
+        class AuthorResource(resources.ModelResource):
+            class Meta:
+                model = Author
+
+        resource = AuthorResource()
+        dataset = tablib.Dataset(headers=['id', 'name', 'birthday'])
+        dataset.append(['', 'A.A.Milne', '1882test-01-18'])
+
+        result = resource.import_data(dataset, raise_errors=False)
+
+        self.assertTrue(result.has_errors())
+        self.assertTrue(result.rows[0].errors)
+        msg = ("Column 'birthday': Enter a valid date/time.")
+        actual = result.rows[0].errors[0].error
+        self.assertIsInstance(actual, ValueError)
+        self.assertEqual(msg, str(actual))
+
     def test_import_data_error_saving_model(self):
         row = list(self.dataset.pop())
         # set pk to something that would yield error
@@ -154,8 +189,11 @@ class ModelResourceTest(TestCase):
 
         self.assertTrue(result.has_errors())
         self.assertTrue(result.rows[0].errors)
-        msg = 'ValueError("invalid literal for int() with base 10: \'foo\'",)'
-        self.assertTrue(result.rows[0].errors[0].error, msg)
+        msg = "invalid literal for int() with base 10: 'foo'"
+        actual = result.rows[0].errors[0].error
+        self.assertIsInstance(actual, ValueError)
+        self.assertEqual("Column 'id': invalid literal for int() with "
+            "base 10: 'foo'", str(actual))
 
     def test_import_data_delete(self):
 
@@ -274,6 +312,29 @@ class ModelResourceTest(TestCase):
         book = Book.objects.get(name='FooBook')
         self.assertIn(cat1, book.categories.all())
 
+    def test_m2m_options_import(self):
+        cat1 = Category.objects.create(name='Cat 1')
+        cat2 = Category.objects.create(name='Cat 2')
+        headers = ['id', 'name', 'categories']
+        row = [None, 'FooBook', "Cat 1|Cat 2"]
+        dataset = tablib.Dataset(row, headers=headers)
+
+        class BookM2MResource(resources.ModelResource):
+            categories = fields.Field(
+                attribute='categories',
+                widget=widgets.ManyToManyWidget(Category, field='name',
+                                                separator='|')
+            )
+
+            class Meta:
+                model = Book
+
+        resource = BookM2MResource()
+        resource.import_data(dataset, raise_errors=True)
+        book = Book.objects.get(name='FooBook')
+        self.assertIn(cat1, book.categories.all())
+        self.assertIn(cat2, book.categories.all())
+
     def test_related_one_to_one(self):
         # issue #17 - Exception when attempting access something on the
         # related_name
@@ -328,6 +389,55 @@ class ModelResourceTest(TestCase):
         result = resource.import_data(dataset, raise_errors=True)
         self.assertFalse(result.has_errors())
         self.assertEqual(len(result.rows), 0)
+
+    def test_link_to_nonexistent_field(self):
+        with self.assertRaises(FieldDoesNotExist) as cm:
+            class BrokenBook(resources.ModelResource):
+                class Meta:
+                    model = Book
+                    fields = ('nonexistent__invalid',)
+        self.assertEqual("Book.nonexistent: Book has no field named 'nonexistent'",
+            cm.exception.args[0])
+
+        with self.assertRaises(FieldDoesNotExist) as cm:
+            class BrokenBook(resources.ModelResource):
+                class Meta:
+                    model = Book
+                    fields = ('author__nonexistent',)
+        self.assertEqual("Book.author.nonexistent: Author has no field named "
+            "'nonexistent'", cm.exception.args[0])
+
+    def test_link_to_nonrelation_field(self):
+        with self.assertRaises(KeyError) as cm:
+            class BrokenBook(resources.ModelResource):
+                class Meta:
+                    model = Book
+                    fields = ('published__invalid',)
+        self.assertEqual("Book.published is not a relation",
+            cm.exception.args[0])
+
+        with self.assertRaises(KeyError) as cm:
+            class BrokenBook(resources.ModelResource):
+                class Meta:
+                    model = Book
+                    fields = ('author__name__invalid',)
+        self.assertEqual("Book.author.name is not a relation",
+            cm.exception.args[0])
+
+    def test_override_field_construction_in_resource(self):
+        class B(resources.ModelResource):
+            class Meta:
+                model = Book
+                fields = ('published',)
+
+            @classmethod
+            def field_from_django_field(self, field_name, django_field, readonly):
+                if field_name == 'published':
+                    return {'sound': 'quack'}
+
+        resource = B()
+        self.assertEqual({'sound': 'quack'}, B.fields['published'])
+
 
 class ModelResourceTransactionTest(TransactionTestCase):
 

@@ -9,9 +9,10 @@ import tablib
 from diff_match_patch import diff_match_patch
 
 from django.utils.safestring import mark_safe
-from django.utils.datastructures import SortedDict
 from django.utils import six
 from django.db import transaction
+from django.db.models.fields import FieldDoesNotExist
+from django.db.models.query import QuerySet
 from django.db.models.related import RelatedObject
 from django.conf import settings
 
@@ -28,6 +29,10 @@ try:
 except ImportError:
     from django.utils.encoding import force_unicode as force_text
 
+try:
+    from collections import OrderedDict
+except ImportError:
+    from django.utils.datastructures import SortedDict as OrderedDict
 
 USE_TRANSACTIONS = getattr(settings, 'IMPORT_EXPORT_USE_TRANSACTIONS', False)
 
@@ -101,7 +106,7 @@ class DeclarativeMetaclass(type):
                     field.column_name = field_name
                 declared_fields.append((field_name, field))
 
-        attrs['fields'] = SortedDict(declared_fields)
+        attrs['fields'] = OrderedDict(declared_fields)
         new_class = super(DeclarativeMetaclass, cls).__new__(cls, name,
                 bases, attrs)
         opts = getattr(new_class, 'Meta', None)
@@ -285,6 +290,7 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
             back.
         """
         result = Result()
+        result.diff_headers = self.get_diff_headers()
 
         if use_transactions is None:
             use_transactions = self.get_use_transactions()
@@ -303,7 +309,7 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         try:
             self.before_import(dataset, real_dry_run)
         except Exception as e:
-            tb_info = traceback.format_exc(sys.exc_info()[2])
+            tb_info = traceback.format_exc(2)
             result.base_errors.append(Error(repr(e), tb_info))
             if raise_errors:
                 if use_transactions:
@@ -339,13 +345,13 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
                         self.save_instance(instance, real_dry_run)
                         self.save_m2m(instance, row, real_dry_run)
                         # Add object info to RowResult for LogEntry
-                        row_result.object_repr = str(instance)
+                        row_result.object_repr = force_text(instance)
                         row_result.object_id = instance.pk
                     row_result.diff = self.get_diff(original, instance,
                             real_dry_run)
             except Exception as e:
                 tb_info = traceback.format_exc(2)
-                row_result.errors.append(Error(repr(e), tb_info))
+                row_result.errors.append(Error(e, tb_info))
                 if raise_errors:
                     if use_transactions:
                         transaction.rollback()
@@ -378,7 +384,7 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
         return [self.export_field(field, obj) for field in self.get_fields()]
 
     def get_export_headers(self):
-        headers = [field.column_name for field in self.get_fields()]
+        headers = [force_text(field.column_name) for field in self.get_fields()]
         return headers
 
     def export(self, queryset=None):
@@ -389,9 +395,14 @@ class Resource(six.with_metaclass(DeclarativeMetaclass)):
             queryset = self.get_queryset()
         headers = self.get_export_headers()
         data = tablib.Dataset(headers=headers)
-        # Iterate without the queryset cache, to avoid wasting memory when
-        # exporting large datasets.
-        for obj in queryset.iterator():
+
+        if isinstance(queryset, QuerySet):
+            # Iterate without the queryset cache, to avoid wasting memory when
+            # exporting large datasets.
+            iterable = queryset.iterator()
+        else:
+            iterable = queryset
+        for obj in iterable:
             data.append(self.export_resource(obj))
         return data
 
@@ -420,13 +431,11 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
                 if f.name in declared_fields:
                     continue
 
-                FieldWidget = new_class.widget_from_django_field(f)
-                widget_kwargs = new_class.widget_kwargs_for_field(f.name)
-                field = Field(attribute=f.name, column_name=f.name,
-                        widget=FieldWidget(**widget_kwargs))
+                field = new_class.field_from_django_field(f.name, f,
+                    readonly=False)
                 field_list.append((f.name, field, ))
 
-            new_class.fields.update(SortedDict(field_list))
+            new_class.fields.update(OrderedDict(field_list))
 
             #add fields that follow relationships
             if opts.fields is not None:
@@ -439,20 +448,31 @@ class ModelDeclarativeMetaclass(DeclarativeMetaclass):
 
                     model = opts.model
                     attrs = field_name.split('__')
-                    for attr in attrs[0:-1]:
-                        f = model._meta.get_field_by_name(attr)[0]
-                        model = f.rel.to
-                    f = model._meta.get_field_by_name(attrs[-1])[0]
+                    for i, attr in enumerate(attrs):
+                        verbose_path = ".".join([opts.model.__name__] + attrs[0:i+1])
+
+                        try:
+                            f = model._meta.get_field_by_name(attr)[0]
+                        except FieldDoesNotExist as e:
+                            raise FieldDoesNotExist("%s: %s has no field named '%s'" %
+                                (verbose_path, model.__name__, attr))
+
+                        if i < len(attrs) - 1:
+                            # We're not at the last attribute yet, so check that
+                            # we're looking at a relation, and move on to the
+                            # next model.
+                            if f.rel is None:
+                                raise KeyError('%s is not a relation' % verbose_path)
+                            model = f.rel.to
+
                     if isinstance(f, RelatedObject):
                         f = f.field
 
-                    FieldWidget = new_class.widget_from_django_field(f)
-                    widget_kwargs = new_class.widget_kwargs_for_field(field_name)
-                    field = Field(attribute=field_name, column_name=field_name,
-                            widget=FieldWidget(**widget_kwargs), readonly=True)
-                    field_list.append((field_name, field, ))
+                    field = new_class.field_from_django_field(field_name, f,
+                        readonly=True)
+                    field_list.append((field_name, field))
 
-                new_class.fields.update(SortedDict(field_list))
+                new_class.fields.update(OrderedDict(field_list))
 
         return new_class
 
@@ -498,6 +518,18 @@ class ModelResource(six.with_metaclass(ModelDeclarativeMetaclass, Resource)):
             return self._meta.widgets.get(field_name, {})
         return {}
 
+    @classmethod
+    def field_from_django_field(self, field_name, django_field, readonly):
+        """
+        Returns a Resource Field instance for the given Django model field.
+        """
+
+        FieldWidget = self.widget_from_django_field(django_field)
+        widget_kwargs = self.widget_kwargs_for_field(field_name)
+        field = Field(attribute=field_name, column_name=field_name,
+                widget=FieldWidget(**widget_kwargs), readonly=readonly)
+        return field
+
     def get_import_id_fields(self):
         return self._meta.import_id_fields
 
@@ -523,3 +555,4 @@ def modelresource_factory(model, resource_class=ModelResource):
 
     metaclass = ModelDeclarativeMetaclass
     return metaclass(class_name, (resource_class,), class_attrs)
+

@@ -18,6 +18,7 @@ from .forms import (
     ImportForm,
     ConfirmImportForm,
     ExportForm,
+    export_action_form_factory,
 )
 from .resources import (
     modelresource_factory,
@@ -43,7 +44,17 @@ DEFAULT_FORMATS = (
 )
 
 
-class ImportMixin(object):
+class ImportExportMixinBase(object):
+    def get_model_info(self):
+        # module_name is renamed to model_name in Django 1.8
+        app_label = self.model._meta.app_label
+        try:
+            return (app_label, self.model._meta.model_name,)
+        except AttributeError:
+            return (app_label, self.model._meta.module_name,)
+
+
+class ImportMixin(ImportExportMixinBase):
     """
     Import mixin.
     """
@@ -61,7 +72,7 @@ class ImportMixin(object):
 
     def get_urls(self):
         urls = super(ImportMixin, self).get_urls()
-        info = self.model._meta.app_label, self.model._meta.module_name
+        info = self.get_model_info()
         my_urls = patterns(
             '',
             url(r'^process_import/$',
@@ -126,21 +137,21 @@ class ImportMixin(object):
             }
             content_type_id=ContentType.objects.get_for_model(self.model).pk
             for row in result:
-                LogEntry.objects.log_action(
-                    user_id=request.user.pk,
-                    content_type_id=content_type_id,
-                    object_id=row.object_id,
-                    object_repr=row.object_repr,
-                    action_flag=logentry_map[row.import_type],
-                    change_message="%s through import_export" % row.import_type,
-                )
+                if row.import_type != row.IMPORT_TYPE_SKIP:
+                    LogEntry.objects.log_action(
+                        user_id=request.user.pk,
+                        content_type_id=content_type_id,
+                        object_id=row.object_id,
+                        object_repr=row.object_repr,
+                        action_flag=logentry_map[row.import_type],
+                        change_message="%s through import_export" % row.import_type,
+                    )
 
             success_message = _('Import finished')
             messages.success(request, success_message)
             import_file.close()
 
-            url = reverse('admin:%s_%s_changelist' %
-                          (opts.app_label, opts.module_name),
+            url = reverse('admin:%s_%s_changelist' % self.get_model_info(),
                           current_app=self.admin_site.name)
             return HttpResponseRedirect(url)
 
@@ -198,7 +209,7 @@ class ImportMixin(object):
                                 context, current_app=self.admin_site.name)
 
 
-class ExportMixin(object):
+class ExportMixin(ImportExportMixinBase):
     """
     Export mixin.
     """
@@ -215,12 +226,11 @@ class ExportMixin(object):
 
     def get_urls(self):
         urls = super(ExportMixin, self).get_urls()
-        info = self.model._meta.app_label, self.model._meta.module_name
         my_urls = patterns(
             '',
             url(r'^export/$',
                 self.admin_site.admin_view(self.export_action),
-                name='%s_%s_export' % info),
+                name='%s_%s_export' % self.get_model_info()),
         )
         return my_urls + urls
 
@@ -267,7 +277,20 @@ class ExportMixin(object):
                         self.list_max_show_all, self.list_editable,
                         self)
 
-        return cl.query_set
+        # query_set has been renamed to queryset in Django 1.8
+        try:
+            return cl.queryset
+        except AttributeError:
+            return cl.query_set
+
+    def get_export_data(self, file_format, queryset):
+        """
+        Returns file_format representation for given queryset.
+        """
+        resource_class = self.get_export_resource_class()
+        data = resource_class().export(queryset)
+        export_data = file_format.export_data(data)
+        return export_data
 
     def export_action(self, request, *args, **kwargs):
         formats = self.get_export_formats()
@@ -277,13 +300,14 @@ class ExportMixin(object):
                 int(form.cleaned_data['file_format'])
             ]()
 
-            resource_class = self.get_export_resource_class()
             queryset = self.get_export_queryset(request)
-            data = resource_class().export(queryset)
-            response = HttpResponse(
-                file_format.export_data(data),
-                mimetype='application/octet-stream',
-            )
+            export_data = self.get_export_data(file_format, queryset)
+            content_type = 'application/octet-stream'
+            # Django 1.7 uses the content_type kwarg instead of mimetype
+            try:
+                response = HttpResponse(export_data, content_type=content_type)
+            except TypeError:
+                response = HttpResponse(export_data, mimetype=content_type)
             response['Content-Disposition'] = 'attachment; filename=%s' % (
                 self.get_export_filename(file_format),
             )
@@ -307,4 +331,64 @@ class ImportExportMixin(ImportMixin, ExportMixin):
 class ImportExportModelAdmin(ImportExportMixin, admin.ModelAdmin):
     """
     Subclass of ModelAdmin with import/export functionality.
+    """
+
+
+class ExportActionModelAdmin(ExportMixin, admin.ModelAdmin):
+    """
+    Subclass of ModelAdmin with export functionality implemented as an
+    admin action.
+    """
+
+    # Don't use custom change list template.
+    change_list_template = None
+
+    def __init__(self, *args, **kwargs):
+        """
+        Adds a custom action form initialized with the available export
+        formats.
+        """
+        choices = []
+        formats = self.get_export_formats()
+        if formats:
+            choices.append(('', '---'))
+            for i, f in enumerate(formats):
+                choices.append((str(i), f().get_title()))
+
+        self.action_form = export_action_form_factory(choices)
+        super(ExportActionModelAdmin, self).__init__(*args, **kwargs)
+
+    def export_admin_action(self, request, queryset):
+        """
+        Exports the selected rows using file_format.
+        """
+        export_format = request.POST.get('file_format')
+
+        if not export_format:
+            messages.warning(request, _('You must select an export format.'))
+        else:
+            formats = self.get_export_formats()
+            file_format = formats[int(export_format)]()
+
+            export_data = self.get_export_data(file_format, queryset)
+            content_type = 'application/octet-stream'
+            # Django 1.7 uses the content_type kwarg instead of mimetype
+            try:
+                response = HttpResponse(export_data, content_type=content_type)
+            except TypeError:
+                response = HttpResponse(export_data, mimetype=content_type)
+            response['Content-Disposition'] = 'attachment; filename=%s' % (
+                self.get_export_filename(file_format),
+            )
+            return response
+    export_admin_action.short_description = _(
+        'Export selected %(verbose_name_plural)s')
+
+    actions = [export_admin_action]
+
+
+class ImportExportActionModelAdmin(ImportMixin, ExportActionModelAdmin):
+    """
+    Subclass of ExportActionModelAdmin with import/export functionality.
+    Export functionality is implemented as an admin action.
     """
